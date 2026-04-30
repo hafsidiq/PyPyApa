@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Generates Auto Formwork (15mm panels) separated strictly per element with automatic hole cutouts and split spans for intersections."""
+"""Generates Auto Formwork (15mm panels) separated strictly per element, handles Intersections, Grouping, and REVIT LINKS."""
 
 import clr
 import os
@@ -32,7 +32,7 @@ def get_id_value(id_obj):
 XAML_CONTENT = """
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Auto Formwork Pro - Precision Sliced" Width="440" Height="720" 
+        Title="Auto Formwork Pro - Link Supported" Width="450" Height="740" 
         WindowStartupLocation="CenterScreen" Background="#F8F9FA" FontFamily="Segoe UI">
     <Grid Margin="20">
         <Grid.RowDefinitions>
@@ -52,7 +52,8 @@ XAML_CONTENT = """
             <ComboBoxItem Content="Active View Workspace"/>
             <ComboBoxItem Content="Entire Project"/>
             <ComboBoxItem Content="Select By Level"/>
-            <ComboBoxItem Content="Manual Selection (Cursor)"/>
+            <ComboBoxItem Content="Manual Selection (Host Element)"/>
+            <ComboBoxItem Content="Manual Selection (Linked Element)" FontWeight="Bold" Foreground="#D83B01"/>
         </ComboBox>
         
         <ScrollViewer Grid.Row="2" x:Name="scrollLevels" Visibility="Collapsed" MaxHeight="90" Margin="0,0,0,15" Background="White" BorderBrush="#CED4DA" BorderThickness="1">
@@ -71,7 +72,8 @@ XAML_CONTENT = """
         </StackPanel>
         
         <StackPanel Grid.Row="6" Margin="0,0,0,20" Background="#E9ECEF">
-            <CheckBox x:Name="chkMTO" Content="Auto-Generate Material Takeoff Schedule" IsChecked="True" Margin="10"/>
+            <CheckBox x:Name="chkMTO" Content="Auto-Generate Material Takeoff Schedule" IsChecked="True" Margin="10,10,10,5"/>
+            <CheckBox x:Name="chkGroupHost" Content="Group Formwork per Host ID (Satu Kesatuan)" IsChecked="True" Margin="10,0,10,10" FontWeight="Bold" Foreground="#005A9E"/>
         </StackPanel>
 
         <Button Grid.Row="8" x:Name="btnRun" Content="GENERATE SLICED FORMWORK (15mm)" Height="45" 
@@ -116,22 +118,27 @@ class FormworkUI(forms.WPFWindow):
         self.do_stairs = self.chkStairs.IsChecked
         self.do_generic = self.chkGeneric.IsChecked
         self.generate_mto = self.chkMTO.IsChecked
+        self.group_by_host = self.chkGroupHost.IsChecked
         self.selected_level_ids = [cb.Tag for cb in self.level_checkboxes if cb.IsChecked]
         self.Close()
 
 # ==========================================
-# 2. HELPER FUNCTIONS
+# 2. HELPER FUNCTIONS & CLASSES
 # ==========================================
+class ElementWrapper:
+    """Wrapper to handle coordinates and documents whether an element is Local or Linked."""
+    def __init__(self, element, source_doc, transform, is_linked):
+        self.Element = element
+        self.SourceDoc = source_doc
+        self.Transform = transform
+        self.IsLinked = is_linked
+
 class StructuralSelectionFilter(ISelectionFilter):
+    def __init__(self, valid_cat_ints):
+        self.valid_cat_ints = valid_cat_ints
     def AllowElement(self, elem):
         if not elem.Category: return False
-        cat_val = int(get_id_value(elem.Category.Id))
-        allowed = [
-            int(BuiltInCategory.OST_StructuralColumns), int(BuiltInCategory.OST_StructuralFraming), 
-            int(BuiltInCategory.OST_StructuralFoundation), int(BuiltInCategory.OST_Floors), 
-            int(BuiltInCategory.OST_Walls), int(BuiltInCategory.OST_Stairs), int(BuiltInCategory.OST_GenericModel)
-        ]
-        return cat_val in allowed
+        return int(get_id_value(elem.Category.Id)) in self.valid_cat_ints
     def AllowReference(self, ref, xyz): 
         return False
 
@@ -173,29 +180,32 @@ def get_element_solid(element):
         except: pass
     return main_solid
 
-def get_intersecting_solids(elem, doc, valid_cats):
-    """Finds all surrounding structural elements and extracts their solids to be used as 'Cutters'."""
-    bb = elem.get_BoundingBox(None)
+def get_intersecting_solids(elem, target_doc, valid_cats, transform, is_linked):
+    """Finds intersecting elements inside the source document and transforms them to Host coordinates."""
+    bb = elem.get_BoundingBox(None) # Local bounding box
     if not bb: return []
     
-    # Expand bounding box slightly (1 foot) to catch all flush/touching elements
     min_pt = XYZ(bb.Min.X - 1.0, bb.Min.Y - 1.0, bb.Min.Z - 1.0)
     max_pt = XYZ(bb.Max.X + 1.0, bb.Max.Y + 1.0, bb.Max.Z + 1.0)
     outline = Outline(min_pt, max_pt)
     
     bb_filter = BoundingBoxIntersectsFilter(outline)
-    nearby_elems = FilteredElementCollector(doc).WherePasses(bb_filter).WhereElementIsNotElementType().ToElements()
+    nearby_elems = FilteredElementCollector(target_doc).WherePasses(bb_filter).WhereElementIsNotElementType().ToElements()
     
     invaders = []
     valid_cat_ints = [int(get_id_value(c)) for c in valid_cats]
     
     for n in nearby_elems:
-        if n.Id == elem.Id: continue # Skip itself
+        if n.Id == elem.Id: continue 
         if not n.Category: continue
         if int(get_id_value(n.Category.Id)) not in valid_cat_ints: continue
         
         s = get_element_solid(n)
-        if s: invaders.append(s)
+        if s: 
+            # If from a linked file, shift the invader solid to Host Coordinates
+            if is_linked:
+                s = SolidUtils.CreateTransformed(s, transform)
+            invaders.append(s)
         
     return invaders
 
@@ -207,7 +217,7 @@ def get_category_name(cat_val):
         int(BuiltInCategory.OST_Floors): "Slab",
         int(BuiltInCategory.OST_Walls): "Wall",
         int(BuiltInCategory.OST_Stairs): "Stairs",
-        int(BuiltInCategory.OST_GenericModel): "Generic Model"
+        int(BuiltInCategory.OST_GenericModel): "GenericModel" 
     }
     return cat_names.get(cat_val, "Other")
 
@@ -230,8 +240,8 @@ def create_formwork_mto(doc):
         elif name == "Material: Area": f_mat_area = f
         elif name == "Material: Volume": f_mat_vol = f
         
-    if f_comments: mto.Definition.AddField(f_comments)
     if f_mark: mto.Definition.AddField(f_mark)  
+    if f_comments: mto.Definition.AddField(f_comments)
     if f_mat_name: mto.Definition.AddField(f_mat_name)
     if f_mat_area: 
         area_f = mto.Definition.AddField(f_mat_area)
@@ -274,14 +284,36 @@ def main():
     if not target_cats:
         return forms.alert("Please check at least one structural category.")
 
-    elements = []
-    if ui.scope == "Manual Selection (Cursor)":
+    valid_cats_ints = [int(get_id_value(c)) for c in target_cats]
+    elements_to_process = [] # List of ElementWrapper
+
+    # ==========================================
+    # SELECTION LOGIC (HOST VS LINKED)
+    # ==========================================
+    if ui.scope == "Manual Selection (Linked Element)":
         try:
-            sel_filter = StructuralSelectionFilter()
-            references = uidoc.Selection.PickObjects(ObjectType.Element, sel_filter, "Select Elements")
-            valid_cats_ints = [int(get_id_value(c)) for c in target_cats]
-            elements = [doc.GetElement(ref) for ref in references if int(get_id_value(doc.GetElement(ref).Category.Id)) in valid_cats_ints]
+            references = uidoc.Selection.PickObjects(ObjectType.LinkedElement, "Select Structural Elements inside the Link")
+            for ref in references:
+                link_inst = doc.GetElement(ref.ElementId)
+                if not isinstance(link_inst, RevitLinkInstance): continue
+                
+                link_doc = link_inst.GetLinkDocument()
+                linked_elem = link_doc.GetElement(ref.LinkedElementId)
+                
+                if linked_elem.Category and int(get_id_value(linked_elem.Category.Id)) in valid_cats_ints:
+                    tf = link_inst.GetTotalTransform()
+                    elements_to_process.append(ElementWrapper(linked_elem, link_doc, tf, True))
+        except: return
+
+    elif ui.scope == "Manual Selection (Host Element)":
+        try:
+            sel_filter = StructuralSelectionFilter(valid_cats_ints)
+            references = uidoc.Selection.PickObjects(ObjectType.Element, sel_filter, "Select Elements in Host")
+            for ref in references:
+                e = doc.GetElement(ref)
+                elements_to_process.append(ElementWrapper(e, doc, Transform.Identity, False))
         except: return 
+        
     else:
         for cat_id in target_cats:
             cat_enum = System.Enum.ToObject(BuiltInCategory, int(get_id_value(cat_id)))
@@ -290,33 +322,61 @@ def main():
             else: 
                 collector = FilteredElementCollector(doc).OfCategory(cat_enum).WhereElementIsNotElementType()
             
-            if ui.scope == "Select By Level": 
-                elements.extend([e for e in collector.ToElements() if is_element_on_levels(e, ui.selected_level_ids)])
-            else: 
-                elements.extend(collector.ToElements())
+            for e in collector.ToElements():
+                if ui.scope == "Select By Level" and not is_element_on_levels(e, ui.selected_level_ids):
+                    continue
+                elements_to_process.append(ElementWrapper(e, doc, Transform.Identity, False))
 
-    if not elements: return forms.alert("No elements found.")
+    if not elements_to_process: return forms.alert("No valid elements found.")
 
-    # Execute Geometry Creation
     total_generated = 0
     formwork_thickness = 15.0 / 304.8 
     generic_model_cat = ElementId(BuiltInCategory.OST_GenericModel)
 
+    # ==========================================
+    # GEOMETRY GENERATION
+    # ==========================================
     with revit.Transaction("Generate Precision Cut Formwork"):
         wood_mat_id = get_or_create_wood_material(doc)
         try: solid_opts = SolidOptions(wood_mat_id, ElementId.InvalidElementId)
         except: solid_opts = None
 
         with forms.ProgressBar(title='Cutting Holes & Generating Formwork...', step=100) as pb:
-            for i, elem in enumerate(elements):
+            for i, wrapper in enumerate(elements_to_process):
+                
+                elem = wrapper.Element
+                source_doc = wrapper.SourceDoc
+                tf = wrapper.Transform
+                is_link = wrapper.IsLinked
+                
+                host_formwork_ids = List[ElementId]()
+                
                 cat_val = int(get_id_value(elem.Category.Id))
                 category_string = get_category_name(cat_val)
                 
-                solid = get_element_solid(elem)
-                if not solid: continue
+                # Format Host ID explicitly to track links (e.g., L-14502 vs 14502)
+                display_host_id = "L-{}".format(elem.Id.ToString()) if is_link else elem.Id.ToString()
                 
-                # GET ALL SURROUNDING INTERSECTING ELEMENTS
-                invading_solids = get_intersecting_solids(elem, doc, target_cats)
+                base_solid = get_element_solid(elem)
+                if not base_solid: continue
+                
+                # Shift Linked Geometry into Host Coordinate System
+                if is_link:
+                    solid = SolidUtils.CreateTransformed(base_solid, tf)
+                else:
+                    solid = base_solid
+                
+                # Extract Level Metadata from the Source Document (Link or Host)
+                level_name = "UnknownLevel"
+                for p in [BuiltInParameter.FAMILY_BASE_LEVEL_PARAM, BuiltInParameter.INSTANCE_REFERENCE_LEVEL_PARAM, BuiltInParameter.LEVEL_PARAM]:
+                    lvl_param = elem.get_Parameter(p)
+                    if lvl_param and lvl_param.AsElementId() != ElementId.InvalidElementId:
+                        level_elem = source_doc.GetElement(lvl_param.AsElementId())
+                        if level_elem: level_name = level_elem.Name.replace(" ", "")
+                        break
+                
+                # Fetch Clash Intersections (Will be mapped to Host coordinates internally)
+                invading_solids = get_intersecting_solids(elem, source_doc, target_cats, tf, is_link)
                 
                 # ITERATE THROUGH FACES
                 for face in solid.Faces:
@@ -333,7 +393,6 @@ def main():
                         loops = face.GetEdgesAsCurveLoops()
                         if not loops: continue
                         
-                        # Generate the Initial Panel
                         if solid_opts:
                             panel = GeometryCreationUtilities.CreateExtrusionGeometry(List[CurveLoop](loops), normal, formwork_thickness, solid_opts)
                         else:
@@ -341,47 +400,64 @@ def main():
                         
                         if not panel or panel.Volume == 0: continue
                         
-                        # ==========================================
-                        # AUTO-CUT LOGIC (Difference)
-                        # ==========================================
+                        # BOOLEAN CUTS
                         for invader in invading_solids:
                             try:
-                                # This cuts the intersecting structural element OUT OF the formwork panel
                                 panel = BooleanOperationsUtils.ExecuteBooleanOperation(panel, invader, BooleanOperationsType.Difference)
                             except:
-                                # Ignore if boolean fails due to micro-precision, keep the current panel
                                 pass 
                         
-                        # ==========================================
-                        # NEW: SPLIT DISJOINTED VOLUMES
-                        # ==========================================
+                        # SPLIT VOLUMES
                         if panel and panel.Volume > 0: 
                             try:
                                 separated_solids = SolidUtils.SplitVolumes(panel)
                             except:
-                                separated_solids = [panel] # Fallback if splitting fails
+                                separated_solids = [panel]
                                 
-                            # Create DirectShape for EACH separated chunk independently
                             for sep_solid in separated_solids:
                                 if sep_solid.Volume > 0:
                                     ds = DirectShape.CreateElement(doc, generic_model_cat)
                                     ds.AppendShape(List[GeometryObject]([sep_solid]))
                                     
+                                    try:
+                                        centroid = sep_solid.ComputeCentroid()
+                                        cx = int(centroid.X * 304.8)
+                                        cy = int(centroid.Y * 304.8)
+                                        cz = int(centroid.Z * 304.8)
+                                        coord_string = "{},{},{}".format(cx, cy, cz)
+                                    except:
+                                        coord_string = "0,0,0"
+
                                     param_comments = ds.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
-                                    if param_comments: param_comments.Set("Formwork - {}".format(category_string))
+                                    if param_comments: 
+                                        comment_val = "FW-{}-{}-{}".format(category_string, level_name, coord_string)
+                                        param_comments.Set(comment_val)
                                     
                                     param_mark = ds.get_Parameter(BuiltInParameter.ALL_MODEL_MARK)
-                                    if param_mark: param_mark.Set("HostID: {}".format(elem.Id.ToString()))
-                                        
+                                    if param_mark: 
+                                        param_mark.Set("HostID: {}".format(display_host_id))
+                                    
+                                    host_formwork_ids.Add(ds.Id)
                                     total_generated += 1
                     except: pass
                 
-                pb.update_progress(i, len(elements))
+                # ==========================================
+                # GROUPING
+                # ==========================================
+                if ui.group_by_host and host_formwork_ids.Count > 1:
+                    try:
+                        doc.Regenerate() 
+                        group = doc.Create.NewGroup(host_formwork_ids)
+                        group.GroupType.Name = "FW - {} - {}".format(category_string, display_host_id)
+                    except:
+                        pass 
+                
+                pb.update_progress(i, len(elements_to_process))
 
         if ui.generate_mto: 
             create_formwork_mto(doc)
             
-    forms.alert("Successfully generated {} precision-cut formwork objects.\n\nFormwork is sliced per element, has holes where intersected, AND splits into separate independent segments across column junctions.".format(total_generated), title="Success")
+    forms.alert("Successfully generated {} formwork objects.\n\nLinked file geometries were automatically transformed and processed into your Host document coordinate system.".format(total_generated), title="Success")
 
 if __name__ == '__main__':
     main()
