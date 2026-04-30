@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Generates Auto Formwork (15mm panels) separated strictly per element with automatic hole cutouts for intersections."""
+"""Generates Auto Formwork (15mm panels) separated strictly per element with automatic hole cutouts and split spans for intersections."""
 
 import clr
 import os
@@ -318,8 +318,7 @@ def main():
                 # GET ALL SURROUNDING INTERSECTING ELEMENTS
                 invading_solids = get_intersecting_solids(elem, doc, target_cats)
                 
-                element_formwork_panels = List[GeometryObject]()
-                
+                # ITERATE THROUGH FACES
                 for face in solid.Faces:
                     if not isinstance(face, PlanarFace): continue
                     normal = face.FaceNormal
@@ -353,29 +352,36 @@ def main():
                                 # Ignore if boolean fails due to micro-precision, keep the current panel
                                 pass 
                         
+                        # ==========================================
+                        # NEW: SPLIT DISJOINTED VOLUMES
+                        # ==========================================
                         if panel and panel.Volume > 0: 
-                            element_formwork_panels.Add(panel)
+                            try:
+                                separated_solids = SolidUtils.SplitVolumes(panel)
+                            except:
+                                separated_solids = [panel] # Fallback if splitting fails
+                                
+                            # Create DirectShape for EACH separated chunk independently
+                            for sep_solid in separated_solids:
+                                if sep_solid.Volume > 0:
+                                    ds = DirectShape.CreateElement(doc, generic_model_cat)
+                                    ds.AppendShape(List[GeometryObject]([sep_solid]))
+                                    
+                                    param_comments = ds.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
+                                    if param_comments: param_comments.Set("Formwork - {}".format(category_string))
+                                    
+                                    param_mark = ds.get_Parameter(BuiltInParameter.ALL_MODEL_MARK)
+                                    if param_mark: param_mark.Set("HostID: {}".format(elem.Id.ToString()))
+                                        
+                                    total_generated += 1
                     except: pass
-                
-                # Create the final cut DirectShape
-                if element_formwork_panels.Count > 0:
-                    ds = DirectShape.CreateElement(doc, generic_model_cat)
-                    ds.AppendShape(element_formwork_panels)
-                    
-                    param_comments = ds.get_Parameter(BuiltInParameter.ALL_MODEL_INSTANCE_COMMENTS)
-                    if param_comments: param_comments.Set("Formwork - {}".format(category_string))
-                    
-                    param_mark = ds.get_Parameter(BuiltInParameter.ALL_MODEL_MARK)
-                    if param_mark: param_mark.Set("HostID: {}".format(elem.Id.ToString()))
-                        
-                    total_generated += 1
                 
                 pb.update_progress(i, len(elements))
 
         if ui.generate_mto: 
             create_formwork_mto(doc)
             
-    forms.alert("Successfully generated {} precision-cut formwork objects.\n\nFormwork is sliced per element AND automatically has holes where other structural elements intersect (Balok menembus Kolom, dll).".format(total_generated), title="Success")
+    forms.alert("Successfully generated {} precision-cut formwork objects.\n\nFormwork is sliced per element, has holes where intersected, AND splits into separate independent segments across column junctions.".format(total_generated), title="Success")
 
 if __name__ == '__main__':
     main()
